@@ -1,0 +1,21 @@
+services:
+  report:
+    build:
+      context: .
+      target: runtime
+    image: espn-fantasy-digest:runtime
+    env_file:
+      - .env
+    environment:
+      OUTPUT_DIR: /app/output
+    volumes:
+      - ./output:/app/output
+
+  test:
+    build:
+      context: .
+      target: test
+    image: espn-fantasy-digest:test
+    # No env_file: tests are offline and must not need credentials.
+    environment:
+      TZ: America/Mexico_City
