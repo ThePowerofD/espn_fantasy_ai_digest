@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_TZ = "America/Mexico_City"
-DEFAULT_OUTPUT_DIR = "/app/output"
+DEFAULT_OUTPUT_DIR = "output"  # relative to the working dir; Docker sets /app/output explicitly
 
 
 class ConfigError(RuntimeError):

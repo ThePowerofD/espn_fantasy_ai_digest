@@ -9,6 +9,7 @@ recent news.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from datetime import datetime, timedelta, timezone
 
@@ -37,6 +38,8 @@ FA_POSITIONS = ("QB", "RB", "WR", "TE", "K", "D/ST")
 IR_STATUS = {"OUT", "INJURY_RESERVE"}
 
 _ABBREV_TO_PRO_ID = {abbrev.upper(): pid for pid, abbrev in PRO_TEAM_MAP.items() if pid}
+
+log = logging.getLogger(__name__)
 
 
 class FetchError(RuntimeError):
@@ -205,7 +208,8 @@ def _fetch_news(league: League, players, news_dates: dict[int, datetime], now: d
             continue
         try:
             found = latest_headline(league.espn_request.get_player_news(p.playerId))
-        except Exception:  # noqa: BLE001 - news is optional; never fail the digest over it
+        except Exception as exc:  # noqa: BLE001 - news is optional; never fail the digest over it
+            log.debug("News lookup failed for %s: %s", p.name, type(exc).__name__)
             continue
         if found and (flagged or now - found[0] <= NEWS_WINDOW):
             items.append(NewsItem(player=p.name, published=found[0], headline=found[1]))
@@ -421,8 +425,10 @@ def _read_league(cfg: Config, build):
         return build(league)
     except FetchError:
         raise
-    except Exception as exc:  # noqa: BLE001 - re-raised without the original message
-        raise FetchError(f"Failed to read league {cfg.league_id}: {type(exc).__name__}") from None
+    except Exception as exc:  # noqa: BLE001
+        # The message carries only the type. The original stays attached as __cause__
+        # for `--debug`, which scrubs credentials before printing it.
+        raise FetchError(f"Failed to read league {cfg.league_id}: {type(exc).__name__}") from exc
 
 
 def fetch_snapshot(cfg: Config) -> Snapshot:
