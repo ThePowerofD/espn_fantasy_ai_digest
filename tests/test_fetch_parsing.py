@@ -12,10 +12,14 @@ from espn_digest.fetch import (
     find_my_team,
     ir_slot_count,
     latest_headline,
+    owner_label,
     playoff_weeks,
     pro_games_for_week,
+    schedule_facts,
     select_free_agents,
+    standings,
     starting_slots,
+    team_label,
     weekly_points,
 )
 from factories import FAKE_SWID, NOW, SLOTS, ms, raw_free_agent
@@ -42,7 +46,7 @@ SCHEDULE = {
 
 def test_pro_games_for_week_keeps_home_away_and_utc_kickoff():
     games = pro_games_for_week(SCHEDULE, 5)
-    assert games == {1: (False, KICKOFF), 18: (True, KICKOFF)}
+    assert games == {1: (False, KICKOFF, "NO"), 18: (True, KICKOFF, "ATL")}
     assert games[1][1].tzinfo is not None
 
 
@@ -123,7 +127,8 @@ def test_select_free_agents_top_per_position_plus_injured():
         raw_free_agent(300, "Waiver WR", [3, 4, 20, 21], projected=11.0, owned=30.0, waivers=True, clears=clears),
         raw_free_agent(400, "Rams D/ST", [16, 20], projected=6.0, owned=80.0),
     ]
-    agents = select_free_agents(pool, year=2026, week=5, slots=SLOTS, byes={1: 9})
+    games = pro_games_for_week(SCHEDULE, 5)
+    agents = select_free_agents(pool, year=2026, week=5, slots=SLOTS, byes={1: 9}, games=games)
     names = [a.name for a in agents]
 
     rbs = [a for a in agents if a.position == "RB" and a.injury_status == "ACTIVE"]
@@ -134,6 +139,7 @@ def test_select_free_agents_top_per_position_plus_injured():
     assert wr.position == "WR" and wr.on_waivers and wr.waiver_clears == clears.replace(microsecond=0)
     assert wr.eligible_slots == ("RB/WR", "WR")  # BE/IR dropped, league slots only
     assert wr.bye_week == 9 and wr.projected == 11.0
+    assert (wr.opponent, wr.home, wr.kickoff) == ("NO", False, KICKOFF)  # ATL plays @ NO
 
     dst = next(a for a in agents if a.name == "Rams D/ST")
     assert dst.position == "D/ST" and not dst.on_waivers
@@ -157,3 +163,41 @@ def test_find_my_team_fails_clearly():
     league = SimpleNamespace(teams=[team(1, "{AAAA}")])
     with pytest.raises(FetchError, match="Could not identify your team"):
         find_my_team(league, FAKE_SWID, team_id=None)
+
+
+def test_schedule_facts_reads_deadline_and_playoff_shape():
+    raw = {"settings": {
+        "tradeSettings": {"deadlineDate": ms(KICKOFF)},
+        "scheduleSettings": {"matchupPeriodCount": 14, "playoffTeamCount": 6, "playoffMatchupPeriodLength": 1},
+    }}
+    assert schedule_facts(raw) == {
+        "trade_deadline": KICKOFF,
+        "regular_season_weeks": 14,
+        "playoff_teams": 6,
+        "playoff_weeks": (15, 16, 17),
+    }
+    assert schedule_facts({"settings": {}})["trade_deadline"] is None
+
+
+def test_owner_label_first_name_and_last_initial():
+    assert owner_label({"firstName": "Ana", "lastName": "Ruiz", "displayName": "anar99"}) == "Ana R."
+    assert owner_label({"firstName": "Ana", "lastName": ""}) == "Ana"
+    assert owner_label({"firstName": "", "displayName": "anar99"}) == "anar99"
+
+
+def test_team_label_gives_emoji_names_a_handle():
+    fish = SimpleNamespace(team_name="\U0001f41f", owners=[{"firstName": "Ana", "lastName": "Ruiz"},
+                                                          {"firstName": "Luis", "lastName": "Paz"}])
+    assert team_label(fish) == "\U0001f41f (Ana R. & Luis P.)"
+    assert team_label(SimpleNamespace(team_name="Solo ", owners=[])) == "Solo"
+
+
+def test_standings_by_seed_and_marks_my_team():
+    def t(tid, seed, wins, pf):
+        return SimpleNamespace(team_id=tid, team_name=f"T{tid}", owners=[], standing=seed, wins=wins,
+                               losses=5 - wins, ties=0, points_for=pf, points_against=500.0)
+
+    rows = standings([t(1, 2, 4, 600.0), t(2, 1, 4, 650.0), t(3, 3, 1, 700.0)], my_team_id=3)
+    assert [r.team for r in rows] == ["T2", "T1", "T3"]
+    assert [r.mine for r in rows] == [False, False, True]
+    assert (rows[2].wins, rows[2].losses, rows[2].points_for) == (1, 4, 700.0)

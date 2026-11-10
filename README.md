@@ -98,6 +98,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 .\digest.ps1 --rules      # rewrite output\league_context.md (only if league rules change)
 .\digest.ps1 --stdout     # print instead of saving
 .\digest.ps1 --debug      # on failure, show the full error (cookies scrubbed)
+.\digest.ps1 --open       # after a successful run, open the new digest in Notepad
 ```
 
 `digest.ps1` works from any folder (use its full path) and needs no venv
@@ -122,15 +123,19 @@ docker compose run --rm test              # tests (no credentials needed)
 
 | Section | Contents |
 |---|---|
-| Header | Week, when it was generated, your waiver priority (FAAB if your league uses it) |
+| Header | Week, when it was generated, your waiver priority (FAAB if your league uses it), trade deadline and days left, regular-season week and playoff weeks |
 | Matchup | Your score and projection vs your opponent's |
+| Standings | Every team by ESPN's current playoff seed: record, points for and against; yours marked |
 | Roster status | Facts worth noticing: empty starting slots, injured or bye starters, IR spots used, healthy players on IR, Out players on the bench |
 | Starting lineup / Bench and IR | Slot, eligible slots, NFL opponent (home `vs` / away `@`), kickoff, opponent rank vs position, projection, points, last 3 weeks' points, bye week, injury status |
 | Player news | Latest ESPN/Rotowire note for players with news in the last 7 days, and for every injured player regardless of age (a "Day To Day" tag can hide a suspension) |
 | Opponent lineup | Their starters with projections and statuses |
-| Free agents | Top 5 healthy per position by projection, plus the most-owned Out/IR players; each marked FA (add now) or Waivers (with when the claim processes) |
+| Free agents | Top 5 healthy per position by projection, plus the most-owned Out/IR players, with NFL opponent and kickoff; each marked FA (add now) or Waivers (with when the claim processes) |
 | Recent league activity | Adds, drops, trades |
 | Other rosters | Every other team, one line each: player, position, projection, status or bye |
+
+Teams are shown as "Team name (owner)", owner as first name and last initial,
+so a team named only with an emoji is still easy to refer to.
 
 **Opp rank:** 1 = toughest defense against that position, 32 = easiest
 (verified against ESPN's points-allowed data).
@@ -141,8 +146,9 @@ docker compose run --rm test              # tests (no credentials needed)
   include them.
 - **Projections** are ESPN's. Free agents are picked from the ~300 most-owned
   available players, so a deep sleeper can be missed.
-- **Standings** are left out on purpose. They don't affect weekly decisions,
-  and playoff seeding in this league is by total points.
+- **Injury status** is ESPN's tag and can lag: a suspended player or one on the
+  Commissioner's Exempt List may show "Day To Day". The digest doesn't override
+  it; `league_context.md` tells the AI to read a 0 projection plus the news.
 
 ---
 

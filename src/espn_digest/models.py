@@ -44,6 +44,9 @@ class FreeAgent:
     on_waivers: bool = False  # False = free agent, can be added right away
     waiver_clears: datetime | None = None  # aware UTC, ESPN's waiverProcessDate
     bye_week: int | None = None
+    opponent: str | None = None  # None on a bye or when unknown
+    home: bool | None = None
+    kickoff: datetime | None = None  # aware UTC
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,18 @@ class Transaction:
     team: str
     action: str
     player: str
+
+
+@dataclass(frozen=True)
+class Standing:
+    seed: int  # ESPN's current playoff seed
+    team: str  # team label, owner included
+    wins: int
+    losses: int
+    ties: int
+    points_for: float
+    points_against: float
+    mine: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,7 +104,12 @@ class Snapshot:
     ir_slots: int = 0  # IR spots the league allows
     recent_weeks: tuple[int, ...] = ()  # the weeks LineupPlayer.recent_points covers
     news: tuple[NewsItem, ...] = ()  # latest item per rostered player with recent news
-    other_teams: tuple[tuple[str, tuple[LineupPlayer, ...]], ...] = ()  # (team name, roster)
+    other_teams: tuple[tuple[str, tuple[LineupPlayer, ...]], ...] = ()  # (team label, roster)
+    standings: tuple[Standing, ...] = ()  # by seed
+    trade_deadline: datetime | None = None  # aware UTC
+    regular_season_weeks: int = 0
+    playoff_teams: int = 0
+    playoff_weeks: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,4 +130,4 @@ class LeagueRules:
     regular_season_weeks: int = 0
     playoff_teams: int = 0
     playoff_weeks: tuple[int, ...] = ()
-    playoff_seeding: str = ""
+    playoff_tiebreaker: str = ""

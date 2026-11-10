@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from espn_digest.models import LeagueRules, NewsItem
+from espn_digest.models import LeagueRules, NewsItem, Standing
 from espn_digest.render import render_report, render_rules
 from factories import NOW, SLOTS, bye_player, free_agent, player, snapshot
 
@@ -106,14 +106,15 @@ def test_no_opponent_sections_without_matchup():
 
 def test_free_agents_split_healthy_and_injured_with_availability():
     agents = (
-        free_agent("Add Now"),
+        free_agent("Add Now", opponent="MIA", home=True, kickoff=NOW + timedelta(days=3)),
         free_agent("Claim Me", on_waivers=True, waiver_clears=NOW + timedelta(hours=20)),
         free_agent("Hurt FA", injury_status="OUT"),
     )
     r = render_report(snapshot(free_agents=agents), MX)
     healthy = section(r, "Free agents - top 5 per position")
     injured = section(r, "Free agents - Out or IR")
-    assert "| Add Now | WR | RB/WR, WR | BUF | 7 | 9.5 | 40.0% | FA |  |" in healthy
+    assert "| Add Now | WR | RB/WR, WR | BUF | vs MIA | Sun Oct 11 06:00 | 7 | 9.5 | 40.0% | FA |  |" in healthy
+    assert "| Claim Me | WR | RB/WR, WR | BUF | BYE | - |" in healthy  # no game this week
     assert "Waivers, clears Fri Oct 09 02:00" in healthy
     assert "Hurt FA" in injured and "Hurt FA" not in healthy
 
@@ -149,7 +150,7 @@ def test_render_rules_is_static_context():
         regular_season_weeks=14,
         playoff_teams=6,
         playoff_weeks=(15, 16, 17),
-        playoff_seeding="Total points scored",
+        playoff_tiebreaker="Total points scored",
     )
     text = render_rules(rules, "America/Mexico_City")
     for expected in (
@@ -157,9 +158,33 @@ def test_render_rules_is_static_context():
         "**Starting lineup:** QB, RB x2, RB/WR, WR x2, TE, D/ST, K",
         "**Waivers process on:** Monday, Wednesday",
         "**Trade deadline:** Wed Dec 02 2026 11:00",
-        "**Playoffs:** 6 teams, weeks 15, 16, 17, seeded by total points scored",
+        "**Playoffs:** 6 teams, weeks 15, 16, 17, seeded by record; ties broken by total points scored",
+        "may show 'Day To Day' or nothing",
+        "'Team name (owner)'",
         "| TD Pass | 4 |",
         "| Passing Yards | 0.04 |",
         "1 = toughest matchup, 32 = easiest",
     ):
         assert expected in text
+
+
+def test_header_has_trade_deadline_and_season_position():
+    r = render_report(snapshot(trade_deadline=datetime(2026, 12, 2, 17, 0, tzinfo=timezone.utc),
+                               regular_season_weeks=14, playoff_teams=6, playoff_weeks=(15, 16, 17)), MX)
+    assert "- **Trade deadline:** Wed Dec 02 11:00 (55 days left)" in r
+    assert "- **Regular season:** week 5 of 14; playoffs weeks 15-17, top 6 of 10 teams" in r
+
+
+def test_trade_deadline_passed_and_omitted_when_unknown():
+    passed = render_report(snapshot(trade_deadline=NOW - timedelta(days=1)), MX)
+    assert "(passed)" in passed
+    assert "Trade deadline" not in render_report(snapshot(), MX)
+
+
+def test_standings_table_marks_my_team():
+    rows = (Standing(1, "Leader (Ana R.)", 5, 0, 0, 700.0, 500.0),
+            Standing(2, "Me (Bo C.)", 4, 1, 1, 650.5, 520.0, mine=True))
+    table = section(render_report(snapshot(standings=rows), MX), "Standings")
+    assert "| 1 | Leader (Ana R.) | 5-0 | 700.0 | 500.0 |" in table
+    assert "| 2 | Me (Bo C.) (you) | 4-1-1 | 650.5 | 520.0 |" in table
+    assert "## Standings" not in render_report(snapshot(), MX)

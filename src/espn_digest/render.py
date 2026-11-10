@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .models import FreeAgent, LeagueRules, LineupPlayer, Snapshot, Transaction
+from .models import FreeAgent, LeagueRules, LineupPlayer, Snapshot, Standing, Transaction
 
 _BENCH_SLOTS = {"BE", "IR"}
 _HEALTHY = {"ACTIVE", "NORMAL", ""}
@@ -39,11 +39,15 @@ def _injury(status: str) -> str:
     return "" if status in _HEALTHY else status.replace("_", " ").title()
 
 
-def _opponent(p: LineupPlayer) -> str:
-    if p.on_bye or p.opponent is None:
+def _game(opponent: str | None, home: bool | None) -> str:
+    if opponent is None:
         return "BYE"
-    prefix = "vs" if p.home else "@" if p.home is False else ""
-    return f"{prefix} {p.opponent}".strip()
+    prefix = "vs" if home else "@" if home is False else ""
+    return f"{prefix} {opponent}".strip()
+
+
+def _opponent(p: LineupPlayer) -> str:
+    return _game(None if p.on_bye else p.opponent, p.home)
 
 
 def _elig(slots: tuple[str, ...]) -> str:
@@ -114,7 +118,7 @@ def _availability(a: FreeAgent, tz: ZoneInfo) -> str:
     return f"Waivers, clears {_fmt_dt(a.waiver_clears, tz)}" if a.waiver_clears else "Waivers"
 
 
-_FREE_AGENT_HEADERS = ["Player", "Pos", "Elig", "Team", "Bye", "Proj", "Owned", "Avail", "Status"]
+_FREE_AGENT_HEADERS = ["Player", "Pos", "Elig", "Team", "Opp", "Kickoff", "Bye", "Proj", "Owned", "Avail", "Status"]
 
 
 def _free_agent_rows(agents: list[FreeAgent], tz: ZoneInfo) -> list[list[str]]:
@@ -124,6 +128,8 @@ def _free_agent_rows(agents: list[FreeAgent], tz: ZoneInfo) -> list[list[str]]:
             a.position,
             _elig(a.eligible_slots),
             a.pro_team,
+            _game(a.opponent, a.home),
+            _fmt_dt(a.kickoff, tz),
             str(a.bye_week) if a.bye_week else "-",
             _fmt_pts(a.projected),
             f"{a.percent_owned:.1f}%" if a.percent_owned >= 0 else "-",
@@ -150,6 +156,34 @@ def _compact_roster(players: tuple[LineupPlayer, ...], slots: tuple[tuple[str, i
     if ir:
         parts.append("IR: " + "; ".join(entry(p) for p in ir))
     return " | ".join(parts)
+
+
+def _record(r: Standing) -> str:
+    return f"{r.wins}-{r.losses}" + (f"-{r.ties}" if r.ties else "")
+
+
+def _standing_rows(rows: tuple[Standing, ...]) -> list[list[str]]:
+    return [
+        [str(r.seed or "-"), f"{r.team} (you)" if r.mine else r.team, _record(r),
+         _fmt_pts(r.points_for), _fmt_pts(r.points_against)]
+        for r in rows
+    ]
+
+
+def _season_lines(s: Snapshot, tz: ZoneInfo) -> list[str]:
+    """Deadline and playoff timing relative to this week."""
+    lines = []
+    if s.trade_deadline:
+        days = (s.trade_deadline - s.generated_at).days
+        left = "passed" if s.trade_deadline <= s.generated_at else f"{days} days left"
+        lines.append(f"- **Trade deadline:** {s.trade_deadline.astimezone(tz).strftime('%a %b %d %H:%M')} ({left})")
+    if s.regular_season_weeks:
+        season = f"- **Regular season:** week {s.week} of {s.regular_season_weeks}"
+        if s.playoff_weeks:
+            weeks = f"{s.playoff_weeks[0]}-{s.playoff_weeks[-1]}" if len(s.playoff_weeks) > 1 else str(s.playoff_weeks[0])
+            season += f"; playoffs weeks {weeks}, top {s.playoff_teams} of {s.num_teams} teams"
+        lines.append(season)
+    return lines
 
 
 def _activity_rows(rows: tuple[Transaction, ...], tz: ZoneInfo) -> list[list[str]]:
@@ -204,6 +238,7 @@ def render_report(snapshot: Snapshot, tz: ZoneInfo) -> str:
     ]
     if s.faab_remaining is not None:
         out.append(f"- **FAAB remaining:** {s.faab_remaining:g}")
+    out += _season_lines(s, tz)
 
     out += ["", "## Matchup", ""]
     if s.matchup is None:
@@ -222,6 +257,10 @@ def render_report(snapshot: Snapshot, tz: ZoneInfo) -> str:
                 ],
             ),
         ]
+
+    if s.standings:
+        out += ["", "## Standings (by ESPN playoff seed)", ""]
+        out += _table(["Seed", "Team", "W-L", "PF", "PA"], _standing_rows(s.standings))
 
     starters = [p for p in s.lineup if p.slot not in _BENCH_SLOTS]
     reserves = [p for p in s.lineup if p.slot in _BENCH_SLOTS]
@@ -291,8 +330,8 @@ def render_rules(rules: LeagueRules, tz_name: str) -> str:
         out.append(f"- **Regular season:** weeks 1-{r.regular_season_weeks}")
     if r.playoff_teams:
         weeks = ", ".join(str(w) for w in r.playoff_weeks) or "?"
-        seeding = f", seeded by {r.playoff_seeding.lower()}" if r.playoff_seeding else ""
-        out.append(f"- **Playoffs:** {r.playoff_teams} teams, weeks {weeks}{seeding}")
+        tiebreak = f"; ties broken by {r.playoff_tiebreaker.lower()}" if r.playoff_tiebreaker else ""
+        out.append(f"- **Playoffs:** {r.playoff_teams} teams, weeks {weeks}, seeded by record{tiebreak}")
     out += [
         "",
         "## Scoring",
@@ -307,6 +346,11 @@ def render_rules(rules: LeagueRules, tz_name: str) -> str:
         "- **Elig** lists the starting slots a player can fill in this league.",
         "- **Wk N-M pts** are actual points in each recent week, oldest first; '-' means no game.",
         "- **Bye** is the player's NFL bye week.",
+        "- **Status** is ESPN's injury tag, and it can lag the real story: a player who is suspended or on "
+        "the Commissioner's Exempt List may show 'Day To Day' or nothing. A projection of 0 for a player "
+        "who isn't Out or on a bye is the tell; check **Player news**, which always shows the latest item "
+        "for any player with an injury tag, however old.",
+        "- **Teams** are shown as 'Team name (owner)'. **Standings** are ordered by ESPN's current playoff seed.",
         "- **Avail** on free agents: FA = can be added now; Waivers = a claim, processed at the time shown.",
         "- Free agents are picked from the ~300 most-owned available players.",
         f"- All times are {tz_name}, converted from UTC (daylight saving changes are handled).",

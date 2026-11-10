@@ -25,6 +25,7 @@ from .models import (
     Matchup,
     NewsItem,
     Snapshot,
+    Standing,
     Transaction,
 )
 
@@ -73,8 +74,8 @@ def find_my_team(league: League, swid: str, team_id: int | None):
     raise FetchError("Could not identify your team: no owner matched SWID and TEAM_ID is unset or unknown.")
 
 
-def pro_games_for_week(pro_schedule: dict, week: int) -> dict[int, tuple[bool, datetime]]:
-    """Map pro team id -> (is_home, kickoff UTC) for the given week.
+def pro_games_for_week(pro_schedule: dict, week: int) -> dict[int, tuple[bool, datetime, str]]:
+    """Map pro team id -> (is_home, kickoff UTC, opponent abbrev) for the given week.
 
     Built from the raw schedule because espn_api drops the home/away flag and
     converts game dates with the machine's local timezone.
@@ -84,10 +85,9 @@ def pro_games_for_week(pro_schedule: dict, week: int) -> dict[int, tuple[bool, d
         if not pro_team.get("id"):
             continue
         for game in pro_team.get("proGamesByScoringPeriod", {}).get(str(week), []):
-            games[pro_team["id"]] = (
-                game["homeProTeamId"] == pro_team["id"],
-                _utc_from_ms(game["date"]),
-            )
+            is_home = game["homeProTeamId"] == pro_team["id"]
+            opponent_id = game["awayProTeamId"] if is_home else game["homeProTeamId"]
+            games[pro_team["id"]] = (is_home, _utc_from_ms(game["date"]), PRO_TEAM_MAP.get(opponent_id, "?"))
     return games
 
 
@@ -141,7 +141,7 @@ def _lineup_player(box_player, games, slots, byes, recent: tuple[float | None, .
     pro_id = _pro_id(box_player.proTeam)
     game = games.get(pro_id) if pro_id is not None else None
     on_bye = bool(box_player.on_bye_week) or game is None
-    home, kickoff = game if game else (None, None)
+    home, kickoff = game[:2] if game else (None, None)
     opponent = None if on_bye or box_player.pro_opponent == "None" else box_player.pro_opponent
     return LineupPlayer(
         name=box_player.name,
@@ -232,12 +232,13 @@ def _free_agent_pool(league: League, week: int) -> list[dict]:
     return data.get("players", [])
 
 
-def select_free_agents(pool: list[dict], year: int, week: int, slots, byes) -> tuple[FreeAgent, ...]:
+def select_free_agents(pool: list[dict], year: int, week: int, slots, byes, games=None) -> tuple[FreeAgent, ...]:
     """Top FA_PER_POSITION healthy players per position by projection, plus the most-owned injured ones."""
     agents = []
     for entry in pool:
         p = Player(entry, year)
         pro_id = _pro_id(p.proTeam)
+        home, kickoff, opponent = (games or {}).get(pro_id, (None, None, None))
         agents.append(
             FreeAgent(
                 name=p.name,
@@ -250,6 +251,9 @@ def select_free_agents(pool: list[dict], year: int, week: int, slots, byes) -> t
                 on_waivers=entry.get("status") == "WAIVERS",
                 waiver_clears=_utc_from_ms(entry["waiverProcessDate"]) if entry.get("waiverProcessDate") else None,
                 bye_week=byes.get(pro_id) if pro_id is not None else None,
+                opponent=opponent,
+                home=home,
+                kickoff=kickoff,
             )
         )
     healthy = [a for a in agents if a.injury_status not in IR_STATUS]
@@ -261,15 +265,50 @@ def select_free_agents(pool: list[dict], year: int, week: int, slots, byes) -> t
     return tuple(chosen + injured[:INJURED_FA_COUNT])
 
 
-def _transaction_rows(activity) -> list[Transaction]:
+def owner_label(owner: dict) -> str:
+    """'First L.' from an ESPN member; display name when there's no first name."""
+    first = (owner.get("firstName") or "").strip()
+    last = (owner.get("lastName") or "").strip()
+    if first:
+        return f"{first} {last[0]}." if last else first
+    return (owner.get("displayName") or "").strip()
+
+
+def team_label(team) -> str:
+    """Team name plus its owners, so a team named only with an emoji still has a readable handle."""
+    owners = [label for label in (owner_label(o) for o in team.owners or [] if isinstance(o, dict)) if label]
+    name = team.team_name.strip()
+    return f"{name} ({' & '.join(owners)})" if owners else name
+
+
+def standings(teams, my_team_id: int | None = None) -> tuple[Standing, ...]:
+    """Every team by ESPN's current playoff seed."""
+    rows = [
+        Standing(
+            seed=int(t.standing),
+            team=team_label(t),
+            wins=int(t.wins),
+            losses=int(t.losses),
+            ties=int(t.ties),
+            points_for=float(t.points_for),
+            points_against=float(t.points_against),
+            mine=t.team_id == my_team_id,
+        )
+        for t in teams
+    ]
+    return tuple(sorted(rows, key=lambda r: (r.seed or len(rows) + 1, -r.points_for)))
+
+
+def _transaction_rows(activity, labels: dict[int, str]) -> list[Transaction]:
     rows: list[Transaction] = []
     for item in activity:
         when = _utc_from_ms(item.date)
         for team, action, player, _bid in item.actions:
+            name = labels.get(getattr(team, "team_id", None)) or getattr(team, "team_name", None)
             rows.append(
                 Transaction(
                     when=when,
-                    team=getattr(team, "team_name", None) or "Unknown team",
+                    team=name or "Unknown team",
                     action=str(action),
                     player=getattr(player, "name", None) or str(player),
                 )
@@ -277,11 +316,25 @@ def _transaction_rows(activity) -> list[Transaction]:
     return rows
 
 
+def schedule_facts(raw_settings: dict) -> dict:
+    """Trade deadline and season/playoff shape from a raw mSettings response."""
+    raw = raw_settings["settings"]
+    schedule = raw.get("scheduleSettings", {})
+    deadline = (raw.get("tradeSettings") or {}).get("deadlineDate")
+    return {
+        "trade_deadline": _utc_from_ms(deadline) if deadline else None,
+        "regular_season_weeks": int(schedule.get("matchupPeriodCount", 0)),
+        "playoff_teams": int(schedule.get("playoffTeamCount", 0)),
+        "playoff_weeks": playoff_weeks(schedule),
+    }
+
+
 def build_snapshot(league: League, cfg: Config, *, now: datetime | None = None) -> Snapshot:
     """Read everything the report needs from an already-connected League."""
     now = now or datetime.now(timezone.utc)
     week = league.current_week
     team = find_my_team(league, cfg.swid, cfg.team_id)
+    labels = {t.team_id: team_label(t) for t in league.teams}
 
     pro_schedule = league.espn_request.get_pro_schedule()
     games = pro_games_for_week(pro_schedule, week)
@@ -297,6 +350,7 @@ def build_snapshot(league: League, cfg: Config, *, now: datetime | None = None) 
     # Every team's lineup comes from the same box-score request.
     boxes = league.box_scores(week)
     matchup = None
+    opponent_id = None
     lineup: list[LineupPlayer] = []
     my_box_players = []
     rosters: dict[int, tuple[str, tuple[LineupPlayer, ...]]] = {}
@@ -305,7 +359,7 @@ def build_snapshot(league: League, cfg: Config, *, now: datetime | None = None) 
             tid = getattr(side, "team_id", None)
             if tid is None or tid == team.team_id:
                 continue
-            rosters[tid] = (side.team_name, tuple(_lineup_player(p, games, slots, byes) for p in side_lineup))
+            rosters[tid] = (labels.get(tid, side.team_name), tuple(_lineup_player(p, games, slots, byes) for p in side_lineup))
         if team.team_id not in (getattr(box.home_team, "team_id", None), getattr(box.away_team, "team_id", None)):
             continue
         i_am_home = box.home_team.team_id == team.team_id
@@ -316,8 +370,9 @@ def build_snapshot(league: League, cfg: Config, *, now: datetime | None = None) 
         ]
         opp = box.away_team if i_am_home else box.home_team
         if opp is not None and not isinstance(opp, int):
+            opponent_id = opp.team_id
             matchup = Matchup(
-                opponent_name=opp.team_name,
+                opponent_name=labels.get(opp.team_id, opp.team_name),
                 i_am_home=i_am_home,
                 my_score=float(box.home_score if i_am_home else box.away_score),
                 my_projected=float(box.home_projected if i_am_home else box.away_projected),
@@ -326,13 +381,10 @@ def build_snapshot(league: League, cfg: Config, *, now: datetime | None = None) 
                 opponent_lineup=rosters.get(opp.team_id, ("", ()))[1],
             )
 
-    opponent_id = None
-    if matchup is not None:
-        opponent_id = next((tid for tid, (name, _r) in rosters.items() if name == matchup.opponent_name), None)
     other_teams = tuple(sorted((r for tid, r in rosters.items() if tid != opponent_id), key=lambda r: r[0].lower()))
 
-    free_agents = select_free_agents(_free_agent_pool(league, week), league.year, week, slots, byes)
-    activity = tuple(_transaction_rows(league.recent_activity(size=ACTIVITY_COUNT)))
+    free_agents = select_free_agents(_free_agent_pool(league, week), league.year, week, slots, byes, games)
+    activity = tuple(_transaction_rows(league.recent_activity(size=ACTIVITY_COUNT), labels))
     news = _fetch_news(league, my_box_players or team.roster, last_news_dates(card), now)
 
     faab_remaining = None
@@ -356,6 +408,8 @@ def build_snapshot(league: League, cfg: Config, *, now: datetime | None = None) 
         recent_weeks=recent_weeks,
         news=news,
         other_teams=other_teams,
+        standings=standings(league.teams, team.team_id),
+        **schedule_facts(raw_settings),
     )
 
 
@@ -385,7 +439,6 @@ def build_rules(league: League) -> LeagueRules:
     raw = raw_settings["settings"]
     acquisition = raw.get("acquisitionSettings", {})
     schedule = raw.get("scheduleSettings", {})
-    deadline = (raw.get("tradeSettings") or {}).get("deadlineDate")
     s = league.settings
     waivers = f"FAAB (budget {s.acquisition_budget})" if s.faab else "Waiver priority (no FAAB)"
     # ESPN stat ids run passing -> rushing -> receiving -> kicking -> defense, so sorting groups them.
@@ -405,11 +458,9 @@ def build_rules(league: League) -> LeagueRules:
         waiver_days=tuple(d.title() for d in acquisition.get("waiverProcessDays", [])),
         dropped_waiver_hours=int(acquisition.get("waiverHours", 0)),
         waiver_order_resets=bool(acquisition.get("waiverOrderReset", False)),
-        trade_deadline=_utc_from_ms(deadline) if deadline else None,
-        regular_season_weeks=int(schedule.get("matchupPeriodCount", 0)),
-        playoff_teams=int(schedule.get("playoffTeamCount", 0)),
-        playoff_weeks=playoff_weeks(schedule),
-        playoff_seeding=str(schedule.get("playoffSeedingRule", "")).replace("_", " ").capitalize(),
+        # ESPN's playoffSeedingRule is the tiebreaker between teams with the same record, not the seeding order.
+        playoff_tiebreaker=str(schedule.get("playoffSeedingRule", "")).replace("_", " ").capitalize(),
+        **schedule_facts(raw_settings),
     )
 
 
